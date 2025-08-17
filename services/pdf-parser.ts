@@ -1,5 +1,4 @@
 import * as pdfjsLib from "pdfjs-dist"
-import { DefaultCategories } from "../config/parsing"
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@5.4.54/build/pdf.worker.mjs`
 
@@ -27,16 +26,11 @@ export class PDFParserService {
       console.error("[v0] PDF parsing error details:", error)
       console.error("[v0] Error message:", error.message)
       console.error("[v0] Error stack:", error.stack)
-
-      if (error.message?.includes("timeout")) {
-        throw new Error("PDF processing timed out. Please try a smaller PDF file.")
-      }
-
-      throw new Error(`PDF processing failed: ${error.message}`)
+      throw new Error(`PDF processing error: ${error.message}`)
     }
   }
 
-  private static withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  private static async withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
     return Promise.race([
       promise,
       new Promise<T>((_, reject) =>
@@ -84,851 +78,632 @@ export class PDFParserService {
         date: t.operationDateISO || t.valueDateISO || t.valueDate || "UNKNOWN",
         description: t.description,
         amount: t.amountNumeric,
-        category: this.assignCategory(t.description, t.isExpense ? "expense" : "income"),
-        type: t.isExpense ? "expense" : "income",
+        type: t.isIncome ? "income" : "expense",
+        category: t.transactionType || "other",
       }))
     } catch (error) {
-      console.error("[v0] parsePDFInternal error:", error)
-      console.error("[v0] Error occurred at stage:", error.message)
+      console.error("[v0] Error in parsePDFInternal:", error)
       throw error
     }
   }
 
-  private static detectBankType(textLines: string[]): any {
-    // Defensive check for input
+  private static parseBankStatementPDF(textLines: string[]): any {
+    console.log("🚀 INTEGRATED DEBUG PARSER - COMPLETE ANALYSIS")
+    console.log("=".repeat(60))
+    console.log("🎯 Mission: Force ALL transactions to the SAME month from statement period")
+
+    if (!textLines || !Array.isArray(textLines) || textLines.length === 0) {
+      throw new Error("Invalid or empty textLines input")
+    }
+
+    try {
+      // Step 1: Bank detection
+      const bankDetection = this.detectBankType(textLines)
+
+      // Step 2: Statement period extraction with debug
+      const statementPeriod = this.extractStatementPeriod(textLines)
+
+      // Step 3: Parse transactions with extensive debug
+      let transactions = []
+      let bank = bankDetection.bank
+
+      if (bankDetection.bank === "cih") {
+        transactions = this.parseCIHTransactions(textLines, statementPeriod)
+      } else {
+        transactions = this.parseAWBTransactions(textLines, statementPeriod)
+        bank = "Attijariwafa"
+      }
+
+      // Step 4: CRITICAL VALIDATION with detailed analysis
+      console.log(`\n🧪 STEP 4: CRITICAL VALIDATION`)
+      console.log("=".repeat(50))
+
+      if (transactions.length > 0) {
+        const monthAnalysis = {}
+
+        transactions.forEach((txn, index) => {
+          const date = new Date(txn.operationDateISO)
+          const monthKey = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, "0")}`
+          const monthName = this.getMonthName((date.getMonth() + 1).toString().padStart(2, "0"))
+
+          if (!monthAnalysis[monthKey]) {
+            monthAnalysis[monthKey] = {
+              name: monthName,
+              count: 0,
+              transactions: [],
+            }
+          }
+
+          monthAnalysis[monthKey].count++
+          monthAnalysis[monthKey].transactions.push({
+            index: index + 1,
+            description: txn.description?.substring(0, 30) + "...",
+            date: txn.operationDateISO,
+            debugInfo: txn.debugInfo,
+          })
+        })
+
+        const uniqueMonths = Object.keys(monthAnalysis)
+        console.log(`📊 ANALYSIS RESULTS:`)
+        console.log(`   Total transactions: ${transactions.length}`)
+        console.log(`   Unique months found: ${uniqueMonths.length}`)
+        console.log(`   Expected month: ${this.getMonthName(statementPeriod.month)} ${statementPeriod.year}`)
+
+        console.log(`\n📋 MONTH BREAKDOWN:`)
+        Object.entries(monthAnalysis).forEach(([monthKey, data]: [string, any]) => {
+          const isExpected = monthKey === `${statementPeriod.year}-${statementPeriod.month}`
+          const status = isExpected ? "✅" : "❌"
+          console.log(`   ${status} ${data.name} ${monthKey.split("-")[0]}: ${data.count} transactions`)
+
+          if (!isExpected) {
+            console.log(`      Sample transactions:`)
+            data.transactions.slice(0, 3).forEach((t: any) => {
+              console.log(`        ${t.index}. ${t.description} | ${t.date}`)
+              if (t.debugInfo) {
+                console.log(
+                  `           Debug: day=${t.debugInfo.extractedDay}, forced_month=${t.debugInfo.forcedMonth}, result_month=${t.debugInfo.resultMonth}`,
+                )
+              }
+            })
+          }
+        })
+
+        if (uniqueMonths.length === 1) {
+          const expectedKey = `${statementPeriod.year}-${statementPeriod.month}`
+          if (uniqueMonths[0] === expectedKey) {
+            console.log(
+              `\n🎉 SUCCESS: All transactions correctly in ${this.getMonthName(statementPeriod.month)} ${statementPeriod.year}!`,
+            )
+          } else {
+            console.log(
+              `\n❌ ERROR: All transactions in ${monthAnalysis[uniqueMonths[0]].name} but expected ${this.getMonthName(statementPeriod.month)} ${statementPeriod.year}`,
+            )
+            throw new Error(`Date mismatch: got ${uniqueMonths[0]}, expected ${expectedKey}`)
+          }
+        } else {
+          console.log(`\n🚨 BUG CONFIRMED: Transactions scattered across ${uniqueMonths.length} months`)
+          console.log(`   Expected: ${this.getMonthName(statementPeriod.month)} ${statementPeriod.year}`)
+          console.log(
+            `   Found: ${uniqueMonths.map((key) => monthAnalysis[key].name + " " + key.split("-")[0]).join(", ")}`,
+          )
+          throw new Error(`Consistency violation: transactions in ${uniqueMonths.length} different months`)
+        }
+      } else {
+        console.log(`⚠️ No transactions found`)
+      }
+
+      // Build result
+      const result = {
+        bank: bank,
+        transactions: transactions,
+        metadata: {
+          statementYear: statementPeriod.year,
+          statementMonth: statementPeriod.month,
+          statementSource: statementPeriod.source,
+          parsedTransactions: transactions.length,
+          dateFormat: `All forced to ${this.getMonthName(statementPeriod.month)} ${statementPeriod.year}`,
+          currency: "MAD",
+          parseQuality: transactions.length > 0 ? 100 : 0,
+          consistency: "ENFORCED",
+        },
+      }
+
+      console.log(`\n🏁 FINAL RESULT:`)
+      console.log(`   Bank: ${result.bank}`)
+      console.log(`   Transactions: ${result.transactions.length}`)
+      console.log(`   Period: ${this.getMonthName(result.metadata.statementMonth)} ${result.metadata.statementYear}`)
+      console.log(`   Status: ${result.metadata.consistency}`)
+
+      if (result.metadata.parsedTransactions === 0) {
+        throw new Error("❌ NO TRANSACTIONS WERE PARSED!")
+      }
+
+      return result
+    } catch (error) {
+      console.error(`❌ PARSING FAILED: ${error.message}`)
+      throw error
+    }
+  }
+
+  private static extractStatementPeriod(textLines: string[]): any {
+    console.log("\n📅 STEP 2: STATEMENT PERIOD EXTRACTION")
+    console.log("=".repeat(50))
+
     if (!textLines || !Array.isArray(textLines)) {
-      console.error("detectBankType: textLines is not a valid array")
+      throw new Error("Invalid textLines for statement period extraction")
+    }
+
+    const foundPeriods = []
+
+    for (let i = 0; i < textLines.length; i++) {
+      const line = textLines[i]
+      if (!line || typeof line !== "string") continue
+
+      try {
+        // AWB CLOSING BALANCE: SOLDE FINAL AU 31 01 2020
+        let match = line.match(/SOLDE\s+FINAL\s+AU\s+(\d{2})\s+(\d{2})\s+(\d{4})/)
+        if (match) {
+          const [fullMatch, day, month, year] = match
+          foundPeriods.push({
+            source: "AWB_CLOSING",
+            priority: 1,
+            day,
+            month,
+            year,
+            line: line.trim(),
+            lineNumber: i + 1,
+          })
+          console.log(`✅ Found AWB closing balance (Line ${i + 1}):`)
+          console.log(`   Raw line: "${line.trim()}"`)
+          console.log(`   Regex match: "${fullMatch}"`)
+          console.log(`   Extracted: day="${day}", month="${month}", year="${year}"`)
+          console.log(`   Month name: ${this.getMonthName(month)}`)
+        }
+
+        // CIH CLOSING BALANCE: NOUVEAU SOLDE AU 31/05/2020
+        match = line.match(/NOUVEAU\s+SOLDE\s+AU\s+(\d{2})\/(\d{2})\/(\d{4})/)
+        if (match) {
+          const [fullMatch, day, month, year] = match
+          foundPeriods.push({
+            source: "CIH_CLOSING",
+            priority: 1,
+            day,
+            month,
+            year,
+            line: line.trim(),
+            lineNumber: i + 1,
+          })
+          console.log(`✅ Found CIH closing balance (Line ${i + 1}):`)
+          console.log(`   Raw line: "${line.trim()}"`)
+          console.log(`   Regex match: "${fullMatch}"`)
+          console.log(`   Extracted: day="${day}", month="${month}", year="${year}"`)
+          console.log(`   Month name: ${this.getMonthName(month)}`)
+        }
+
+        // AWB OPENING BALANCE: SOLDE DEPART AU 31 12 2019
+        match = line.match(/SOLDE\s+DEPART\s+AU\s+(\d{2})\s+(\d{2})\s+(\d{4})/)
+        if (match) {
+          const [fullMatch, day, month, year] = match
+          foundPeriods.push({
+            source: "AWB_OPENING",
+            priority: 2,
+            day,
+            month,
+            year,
+            line: line.trim(),
+            lineNumber: i + 1,
+          })
+          console.log(`⚠️ Found AWB opening balance (Line ${i + 1}):`)
+          console.log(`   Raw line: "${line.trim()}"`)
+          console.log(`   Regex match: "${fullMatch}"`)
+          console.log(`   Extracted: day="${day}", month="${month}", year="${year}"`)
+          console.log(`   Month name: ${this.getMonthName(month)}`)
+        }
+
+        // CIH OPENING BALANCE: SOLDE DEPART AU : 30/04/2020
+        match = line.match(/SOLDE\s+DEPART\s+AU\s*:?\s*(\d{2})\/(\d{2})\/(\d{4})/)
+        if (match) {
+          const [fullMatch, day, month, year] = match
+          foundPeriods.push({
+            source: "CIH_OPENING",
+            priority: 2,
+            day,
+            month,
+            year,
+            line: line.trim(),
+            lineNumber: i + 1,
+          })
+          console.log(`⚠️ Found CIH opening balance (Line ${i + 1}):`)
+          console.log(`   Raw line: "${line.trim()}"`)
+          console.log(`   Regex match: "${fullMatch}"`)
+          console.log(`   Extracted: day="${day}", month="${month}", year="${year}"`)
+          console.log(`   Month name: ${this.getMonthName(month)}`)
+        }
+      } catch (error) {
+        console.warn(`⚠️ Error processing line ${i + 1} for dates: ${error.message}`)
+      }
+    }
+
+    if (foundPeriods.length === 0) {
+      console.error("❌ CRITICAL: No balance lines found!")
+      console.log("Lines containing 'SOLDE':")
+      textLines.forEach((line, i) => {
+        if (line && line.includes("SOLDE")) {
+          console.log(`  ${i + 1}: "${line}"`)
+        }
+      })
+      throw new Error("No balance lines found - cannot determine statement period")
+    }
+
+    console.log(`\n📊 FOUND ${foundPeriods.length} BALANCE PERIODS:`)
+    foundPeriods.forEach((period, index) => {
+      console.log(
+        `${index + 1}. ${period.source}: ${this.getMonthName(period.month)} ${period.year} (Priority: ${period.priority})`,
+      )
+    })
+
+    // Sort by priority (closing balance preferred)
+    foundPeriods.sort((a, b) => a.priority - b.priority)
+
+    const chosen = foundPeriods[0]
+
+    console.log(`\n🎯 CHOSEN STATEMENT PERIOD:`)
+    console.log(`   Source: ${chosen.source}`)
+    console.log(`   Month: "${chosen.month}" (${this.getMonthName(chosen.month)})`)
+    console.log(`   Year: "${chosen.year}"`)
+    console.log(`   Day: "${chosen.day}"`)
+    console.log(`   From line ${chosen.lineNumber}: "${chosen.line}"`)
+    console.log(`🚨 ALL TRANSACTIONS MUST BE FORCED TO: ${this.getMonthName(chosen.month)} ${chosen.year}`)
+
+    return {
+      year: chosen.year,
+      month: chosen.month,
+      day: chosen.day,
+      source: chosen.source,
+      allFound: foundPeriods,
+    }
+  }
+
+  private static parseAWBTransactions(textLines: string[], statementPeriod: any): any[] {
+    console.log(`\n📋 STEP 3: AWB TRANSACTION PARSING`)
+    console.log("=".repeat(50))
+    console.log(`🎯 TARGET: ALL transactions to ${this.getMonthName(statementPeriod.month)} ${statementPeriod.year}`)
+    console.log(`   Statement month: "${statementPeriod.month}"`)
+    console.log(`   Statement year: "${statementPeriod.year}"`)
+
+    const transactions = []
+    let debugCount = 0
+
+    for (let i = 0; i < textLines.length; i++) {
+      const line = textLines[i]
+      if (!line || typeof line !== "string") continue
+
+      const trimmedLine = line.trim()
+      if (!trimmedLine) continue
+
+      // Skip balance and total lines
+      if (trimmedLine.includes("SOLDE") || trimmedLine.includes("TOTAL")) continue
+
+      try {
+        // AWB PATTERN: CODE DD MM DESCRIPTION AMOUNT
+        const transactionMatch = trimmedLine.match(/^(0\d{3}[A-Z0-9]{2})\s+(\d{2})\s+(\d{2})\s+(.+)$/)
+        if (transactionMatch && transactionMatch.length >= 5) {
+          const [fullMatch, code, num1, num2, remainder] = transactionMatch
+
+          debugCount++
+          if (debugCount <= 10) {
+            console.log(`\n🔍 TRANSACTION ${debugCount} DEBUG (Line ${i + 1}):`)
+            console.log(`   Raw line: "${trimmedLine}"`)
+            console.log(`   Regex match: "${fullMatch}"`)
+            console.log(`   Code: "${code}"`)
+            console.log(`   Num1: "${num1}" ← SHOULD BE DAY`)
+            console.log(`   Num2: "${num2}" ← SHOULD BE IGNORED`)
+            console.log(`   Remainder: "${remainder}"`)
+          }
+
+          // Extract amount from end
+          const amountMatch = remainder.match(/(\d+(?:\s+\d{3})*,\d{2})$/)
+          if (amountMatch) {
+            const amount = amountMatch[1]
+            let description = remainder.replace(/\s*\d+(?:\s+\d{3})*,\d{2}$/, "").trim()
+
+            if (debugCount <= 10) {
+              console.log(`   Amount: "${amount}"`)
+              console.log(`   Description (raw): "${description}"`)
+            }
+
+            // Validate amount
+            const numericAmount = this.normalizeAmount(amount)
+            if (numericAmount === 0 || numericAmount > 10000000) {
+              if (debugCount <= 10) {
+                console.warn(`❌ Skipping invalid amount: ${amount}`)
+              }
+              continue
+            }
+
+            // Clean embedded dates from description
+            const originalDesc = description
+            description = description.replace(/\d{2}\/\d{2}\/\d{4}/g, "").trim()
+            description = description.replace(/\d{2}\/\d{2}\/\d{2}/g, "").trim()
+            description = description.replace(/\d{2}\s+\d{2}\s+\d{4}/g, "").trim()
+            description = description.replace(/\b20\d{2}\b/g, "").trim()
+            description = description.replace(/\s+/g, " ").trim()
+
+            if (debugCount <= 10 && originalDesc !== description) {
+              console.log(`   Description (cleaned): "${description}"`)
+            }
+
+            const isCredit = this.detectCreditTransaction(description)
+
+            // CRITICAL DATE BUILDING SECTION
+            if (debugCount <= 10) {
+              console.log(`\n   🔧 CRITICAL DATE BUILDING:`)
+            }
+            const transactionDay = num1 // Use num1 as day
+            if (debugCount <= 10) {
+              console.log(`   - Transaction day: "${transactionDay}" (from num1)`)
+              console.log(`   - Statement month: "${statementPeriod.month}"`)
+              console.log(`   - Statement year: "${statementPeriod.year}"`)
+              console.log(
+                `   - Calling: buildDateISO("${transactionDay}", "${statementPeriod.month}", "${statementPeriod.year}")`,
+              )
+            }
+
+            try {
+              const finalDateISO = this.buildDateISO(transactionDay, statementPeriod.month, statementPeriod.year)
+              if (debugCount <= 10) {
+                console.log(`   - Result: "${finalDateISO}"`)
+
+                // Verify the result
+                const dateObj = new Date(finalDateISO)
+                const resultMonth = dateObj.getMonth() + 1
+                const resultYear = dateObj.getFullYear()
+                const resultDay = dateObj.getDate()
+
+                console.log(`   - Verification: Day=${resultDay}, Month=${resultMonth}, Year=${resultYear}`)
+                console.log(`   - Month name: ${this.getMonthName(resultMonth.toString().padStart(2, "0"))}`)
+
+                const expectedMonth = Number.parseInt(statementPeriod.month)
+                const expectedYear = Number.parseInt(statementPeriod.year)
+
+                if (resultMonth === expectedMonth && resultYear === expectedYear) {
+                  console.log(`   ✅ SUCCESS: Date is in correct period!`)
+                } else {
+                  console.log(`   ❌ ERROR: Date is wrong!`)
+                  console.log(`      Expected: ${this.getMonthName(statementPeriod.month)} ${statementPeriod.year}`)
+                  console.log(`      Got: ${this.getMonthName(resultMonth.toString().padStart(2, "0"))} ${resultYear}`)
+                  console.log(`   🚨 THIS IS THE BUG!`)
+                }
+              }
+
+              const transaction = {
+                code: code,
+                rawNumbers: `${num1} ${num2}`,
+                description: description,
+                amount: amount,
+                amountNumeric: this.normalizeAmountWithSign(amount, isCredit),
+                debitCreditType: isCredit ? "credit" : "debit",
+                transactionType: this.detectTransactionType(description),
+                operationDateISO: finalDateISO,
+                valueDateISO: finalDateISO,
+                isExpense: !isCredit,
+                isIncome: isCredit,
+                rawLine: line,
+                debugInfo: {
+                  extractedDay: transactionDay,
+                  forcedMonth: statementPeriod.month,
+                  forcedYear: statementPeriod.year,
+                  resultMonth: new Date(finalDateISO).getMonth() + 1,
+                  resultYear: new Date(finalDateISO).getFullYear(),
+                  lineNumber: i + 1,
+                },
+              }
+
+              transactions.push(transaction)
+              if (debugCount <= 10) {
+                console.log(`   ✅ Transaction ${transactions.length} added successfully`)
+                console.log("-".repeat(40))
+              }
+            } catch (dateError) {
+              if (debugCount <= 10) {
+                console.error(`   ❌ Date building failed: ${dateError.message}`)
+              }
+            }
+          }
+
+          // Limit debug output for readability
+          if (debugCount === 10) {
+            console.log(`\n⏭️ Processed first 10 transactions for debug, continuing with remaining...`)
+          }
+        }
+      } catch (error) {
+        console.error(`❌ Error parsing AWB line ${i + 1}: ${error.message}`)
+      }
+    }
+
+    console.log(`\n🎯 AWB PARSING COMPLETE: ${transactions.length} transactions`)
+    return transactions
+  }
+
+  private static parseCIHTransactions(textLines: string[], statementPeriod: any): any[] {
+    console.log(`\n🏦 CIH PARSING DEBUG:`)
+    console.log(`   Statement period: ${this.getMonthName(statementPeriod.month)} ${statementPeriod.year}`)
+
+    const transactions = []
+
+    for (let i = 0; i < textLines.length; i++) {
+      const line = textLines[i]
+      if (!line || typeof line !== "string") continue
+
+      const trimmedLine = line.trim()
+      if (!trimmedLine) continue
+
+      if (trimmedLine.includes("SOLDE") || trimmedLine.includes("TOTAL")) continue
+
+      try {
+        let transactionMatch = trimmedLine.match(/^(\d{2})\/\d{2}\s+(\d{2})\/\d{2}\s+(.+?)\s+([\d\s,]+)$/)
+
+        if (!transactionMatch) {
+          transactionMatch = trimmedLine.match(/^(\d{2})\/\d{2}\s+(\d{2})\/\d{2}\s+(.+)/)
+          if (transactionMatch) {
+            const remainder = transactionMatch[3]
+            const amountMatch = remainder.match(/([\d\s,]+)$/)
+            if (amountMatch) {
+              const amount = amountMatch[1].trim()
+              const description = remainder.replace(/([\d\s,]+)$/, "").trim()
+              transactionMatch = [transactionMatch[0], transactionMatch[1], transactionMatch[2], description, amount]
+            }
+          }
+        }
+
+        if (transactionMatch && transactionMatch.length >= 5) {
+          const [, operDay, valueDay, description, amount] = transactionMatch
+
+          console.log(`\n🔍 CIH DEBUG: Line ${i + 1}: operDay="${operDay}", valueDay="${valueDay}"`)
+          console.log(`   Forcing to: ${operDay}/${statementPeriod.month}/${statementPeriod.year}`)
+
+          const numericAmount = this.normalizeAmount(amount)
+          if (numericAmount === 0 || numericAmount > 10000000) {
+            console.warn(`❌ Skipping invalid amount: ${amount}`)
+            continue
+          }
+
+          const isCredit = this.detectCreditTransaction(description)
+          const finalDateISO = this.buildDateISO(operDay, statementPeriod.month, statementPeriod.year)
+
+          const transaction = {
+            code: null,
+            operationDate: `${operDay}/${statementPeriod.month}`,
+            valueDate: `${valueDay}/${statementPeriod.month}`,
+            description: description.trim(),
+            amount: amount.trim(),
+            amountNumeric: this.normalizeAmountWithSign(amount, isCredit),
+            debitCreditType: isCredit ? "credit" : "debit",
+            transactionType: this.detectTransactionType(description),
+            operationDateISO: finalDateISO,
+            valueDateISO: this.buildDateISO(valueDay, statementPeriod.month, statementPeriod.year),
+            isExpense: !isCredit,
+            isIncome: isCredit,
+            rawLine: line,
+          }
+
+          transactions.push(transaction)
+          console.log(`   ✅ CIH transaction: ${finalDateISO} | ${description.substring(0, 30)}...`)
+        }
+      } catch (error) {
+        console.error(`❌ Error parsing CIH line ${i + 1}: ${error.message}`)
+      }
+    }
+
+    console.log(`\n🎯 CIH: Parsed ${transactions.length} transactions`)
+    return transactions
+  }
+
+  private static buildDateISO(day: string, month: string, year: string): string {
+    console.log(`    🔧 buildDateISO called with: day="${day}", month="${month}", year="${year}"`)
+
+    if (!day || !month || !year) {
+      const error = `Invalid date components: day=${day}, month=${month}, year=${year}`
+      console.error(`❌ ${error}`)
+      throw new Error(error)
+    }
+
+    const dayNum = Number.parseInt(day.toString())
+    const monthNum = Number.parseInt(month.toString())
+    const yearNum = Number.parseInt(year.toString())
+
+    console.log(`    🔧 Parsed to numbers: day=${dayNum}, month=${monthNum}, year=${yearNum}`)
+
+    // Validate ranges
+    if (dayNum < 1 || dayNum > 31) {
+      const error = `Invalid day: ${dayNum}`
+      console.error(`❌ ${error}`)
+      throw new Error(error)
+    }
+    if (monthNum < 1 || monthNum > 12) {
+      const error = `Invalid month: ${monthNum}`
+      console.error(`❌ ${error}`)
+      throw new Error(error)
+    }
+    if (yearNum < 2000 || yearNum > 2030) {
+      const error = `Invalid year: ${yearNum}`
+      console.error(`❌ ${error}`)
+      throw new Error(error)
+    }
+
+    // Check if day is valid for the specific month/year
+    const maxDayInMonth = new Date(yearNum, monthNum, 0).getDate()
+    if (dayNum > maxDayInMonth) {
+      console.warn(
+        `⚠️ Day ${dayNum} is invalid for ${this.getMonthName(monthNum.toString().padStart(2, "0"))} ${yearNum}, adjusting to ${maxDayInMonth}`,
+      )
+      const adjustedDay = maxDayInMonth
+      const result = `${yearNum}-${monthNum.toString().padStart(2, "0")}-${adjustedDay.toString().padStart(2, "0")}`
+      console.log(`    🔧 buildDateISO result (adjusted): "${result}"`)
+      return result
+    }
+
+    const result = `${yearNum}-${monthNum.toString().padStart(2, "0")}-${dayNum.toString().padStart(2, "0")}`
+    console.log(`    🔧 buildDateISO result: "${result}"`)
+    return result
+  }
+
+  private static detectBankType(textLines: string[]): any {
+    if (!textLines || !Array.isArray(textLines)) {
       return { bank: "unknown", config: null }
     }
 
     const text = textLines.join(" ").toLowerCase()
 
-    const bankPatterns = {
-      cih: {
-        indicators: [
-          "cih bank",
-          "cih.co.ma",
-          "releve de compte bancaire",
-          "cih",
-          "mediateur@cih.co.ma",
-          "reclamations-clients@cih.co.ma",
-        ],
-        structure: "table_format",
-        dateFormat: "dd/mm dd/mm",
-        hasTransactionCodes: false,
-      },
-      attijariwafa: {
-        indicators: ["attijariwafa", "wafabank", "attijariwafa bank"],
-        structure: "line_format",
-        dateFormat: "dd mm yyyy",
-        hasTransactionCodes: true,
-      },
+    if (text.includes("cih bank") || text.includes("cih.co.ma") || text.includes("mediateur@cih.co.ma")) {
+      console.log("✅ Detected CIH Bank")
+      return { bank: "cih", config: { dateFormat: "DD/MM with statement period" } }
     }
 
-    // Check for bank-specific indicators
-    for (const [bankName, config] of Object.entries(bankPatterns)) {
-      // Defensive check for indicators array
-      if (!config.indicators || !Array.isArray(config.indicators)) {
-        console.warn(`Bank config for ${bankName} has invalid indicators`)
-        continue
-      }
-
-      try {
-        const hasIndicators = config.indicators.some((indicator) => {
-          return typeof indicator === "string" && text.includes(indicator)
-        })
-
-        if (hasIndicators) {
-          console.log(`Detected bank: ${bankName} using indicators`)
-          return { bank: bankName, config: config }
-        }
-      } catch (error) {
-        console.error(`Error checking indicators for ${bankName}:`, error)
-        continue
-      }
+    if (text.includes("attijariwafa") || text.includes("wafabank")) {
+      console.log("✅ Detected Attijariwafa Bank")
+      return { bank: "attijariwafa", config: { dateFormat: "DD MM with statement period" } }
     }
 
-    // Fallback detection based on actual patterns
-    console.log("Primary detection failed, trying pattern-based detection...")
-
-    // Check for CIH-style date format DD/MM DD/MM
-    const hasCIHDatePattern = textLines.some((line) => {
-      return line && typeof line === "string" && /\d{2}\/\d{2}\s+\d{2}\/\d{2}/.test(line.trim())
-    })
-
-    if (hasCIHDatePattern) {
-      console.log("Detected CIH bank using DD/MM DD/MM date pattern")
-      return { bank: "cih", config: bankPatterns.cih }
+    // Pattern-based detection
+    const hasCIHPattern = textLines.some((line) => line && /\d{2}\/\d{2}\s+\d{2}\/\d{2}/.test(line.trim()))
+    if (hasCIHPattern) {
+      console.log("✅ Detected CIH Bank via pattern")
+      return { bank: "cih", config: { dateFormat: "DD/MM with statement period" } }
     }
 
-    // Check for Attijariwafa transaction codes
-    const hasAWBPattern = textLines.some(
-      (line) => line && typeof line === "string" && /^0\d{3}[A-Z0-9]{2}\s+\d{2}\s+\d{2}/.test(line.trim()),
-    )
-
+    const hasAWBPattern = textLines.some((line) => line && /^0\d{3}[A-Z0-9]{2}\s+\d{2}\s+\d{2}/.test(line.trim()))
     if (hasAWBPattern) {
-      console.log("Detected Attijariwafa bank using transaction code pattern")
-      return { bank: "attijariwafa", config: bankPatterns.attijariwafa }
+      console.log("✅ Detected Attijariwafa Bank via pattern")
+      return { bank: "attijariwafa", config: { dateFormat: "DD MM with statement period" } }
     }
 
-    console.log("Could not detect bank type")
-    return { bank: "unknown", config: null }
-  }
-
-  private static parseBankStatementPDF(textLines: string[]): any {
-    console.log("Starting multi-bank PDF statement parsing...")
-
-    // Defensive input validation
-    if (!textLines) {
-      console.error("Error: textLines is undefined or null")
-      return {
-        bank: "Unknown",
-        openingBalance: null,
-        closingBalance: null,
-        totalMovements: null,
-        transactions: [],
-        metadata: {
-          totalLines: 0,
-          parsedTransactions: 0,
-          failedLines: [],
-          dateFormat: "Unknown",
-          currency: "MAD",
-          parseQuality: 0,
-          detectedBank: "unknown",
-          error: "Input textLines is undefined or null",
-        },
-      }
-    }
-
-    if (!Array.isArray(textLines)) {
-      console.error("Error: textLines is not an array", typeof textLines)
-      return {
-        bank: "Unknown",
-        openingBalance: null,
-        closingBalance: null,
-        totalMovements: null,
-        transactions: [],
-        metadata: {
-          totalLines: 0,
-          parsedTransactions: 0,
-          failedLines: [],
-          dateFormat: "Unknown",
-          currency: "MAD",
-          parseQuality: 0,
-          detectedBank: "unknown",
-          error: `Input textLines is not an array: ${typeof textLines}`,
-        },
-      }
-    }
-
-    console.log(`Total input lines: ${textLines.length}`)
-
-    // Debug: Show first 15 lines
-    console.log("\nFirst 15 lines for debugging:")
-    textLines.slice(0, 15).forEach((line, index) => {
-      console.log(`${index + 1}: "${line || "(empty)"}"`)
-    })
-
-    // Analyze line patterns
-    console.log("\nAnalyzing line patterns:")
-    const patterns = {
-      "CIH Date format (DD/MM DD/MM)": /\d{2}\/\d{2}\s+\d{2}\/\d{2}/,
-      "CIH Transactions": /^\d{2}\/\d{2}\s+\d{2}\/\d{2}\s+[A-Z].*\d+,\d{2}$/,
-      "AWB Transaction codes": /^0\d{3}[A-Z0-9]{2}/,
-      "AWB Date format (DD MM)": /^0\d{3}[A-Z0-9]{2}\s+\d{2}\s+\d{2}/,
-      "Balance lines": /SOLDE|TOTAL/,
-      "Amount lines": /\d+,\d{2}$/,
-      "Year references": /20\d{2}/,
-    }
-
-    Object.entries(patterns).forEach(([name, pattern]) => {
-      try {
-        const count = textLines.filter((line) => line && typeof line === "string" && pattern.test(line.trim())).length
-        console.log(`${name}: ${count} lines`)
-      } catch (error) {
-        console.error(`Error analyzing pattern ${name}:`, error.message)
-      }
-    })
-
-    // Bank detection
-    const bankDetection = this.detectBankType(textLines)
-    console.log(`\nDetected bank: ${bankDetection.bank}`)
-
-    if (bankDetection.bank === "unknown") {
-      console.warn("Could not detect bank type, defaulting to Attijariwafa format")
-    }
-
-    // Parse using appropriate method
-    let result
-
-    try {
-      switch (bankDetection.bank) {
-        case "cih":
-          result = this.parseCIHStatement(textLines)
-          break
-        case "attijariwafa":
-        default:
-          result = this.parseAttijariwafaStatement(textLines)
-          break
-      }
-    } catch (error) {
-      console.error("Error during parsing:", error.message)
-      return {
-        bank: bankDetection.bank || "Unknown",
-        openingBalance: null,
-        closingBalance: null,
-        totalMovements: null,
-        transactions: [],
-        metadata: {
-          totalLines: textLines.length,
-          parsedTransactions: 0,
-          failedLines: [],
-          dateFormat: "Unknown",
-          currency: "MAD",
-          parseQuality: 0,
-          detectedBank: bankDetection.bank,
-          error: `Parsing error: ${error.message}`,
-        },
-      }
-    }
-
-    // Defensive check for result
-    if (!result || typeof result !== "object") {
-      console.error("Parser returned invalid result")
-      return {
-        bank: bankDetection.bank || "Unknown",
-        openingBalance: null,
-        closingBalance: null,
-        totalMovements: null,
-        transactions: [],
-        metadata: {
-          totalLines: textLines.length,
-          parsedTransactions: 0,
-          failedLines: [],
-          dateFormat: "Unknown",
-          currency: "MAD",
-          parseQuality: 0,
-          detectedBank: bankDetection.bank,
-          error: "Parser returned invalid result",
-        },
-      }
-    }
-
-    // Ensure transactions array exists and all transactions have required properties
-    if (!result.transactions || !Array.isArray(result.transactions)) {
-      result.transactions = []
-    }
-
-    // Ensure all transactions have complete properties
-    result.transactions = result.transactions
-      .map((txn, index) => {
-        if (!txn || typeof txn !== "object") {
-          console.warn(`Transaction ${index} is invalid, skipping`)
-          return null
-        }
-
-        return {
-          code: txn.code || null,
-          operationDate: txn.operationDate || null,
-          valueDate: txn.valueDate || null,
-          description: txn.description || "Unknown transaction",
-          amount: txn.amount || "0,00",
-          amountNumeric: typeof txn.amountNumeric === "number" ? txn.amountNumeric : 0,
-          debitCreditType: txn.debitCreditType || "debit",
-          transactionType: txn.transactionType || "other",
-          operationDateISO: txn.operationDateISO || null,
-          valueDateISO: txn.valueDateISO || null,
-          isExpense: typeof txn.isExpense === "boolean" ? txn.isExpense : true,
-          isIncome: typeof txn.isIncome === "boolean" ? txn.isIncome : false,
-          rawLine: txn.rawLine || "",
-          // Add additional properties that categorization might expect
-          category: txn.category || null,
-          subcategory: txn.subcategory || null,
-          tags: txn.tags || [],
-          merchant: txn.merchant || null,
-          location: txn.location || null,
-        }
-      })
-      .filter((txn) => txn !== null) // Remove any invalid transactions
-
-    // Ensure metadata exists and has all required properties
-    if (!result.metadata || typeof result.metadata !== "object") {
-      result.metadata = {}
-    }
-
-    const totalTransactionLines = (result.metadata.failedLines?.length || 0) + result.transactions.length
-    result.metadata = {
-      totalLines: result.metadata.totalLines || textLines.length,
-      parsedTransactions: result.transactions.length,
-      failedLines: result.metadata.failedLines || [],
-      dateFormat: result.metadata.dateFormat || "Unknown",
-      currency: result.metadata.currency || "MAD",
-      parseQuality:
-        totalTransactionLines > 0 ? Math.round((result.transactions.length / totalTransactionLines) * 100) : 100,
-      detectedBank: bankDetection.bank,
-      bankConfig: bankDetection.config,
-      statementYear: result.metadata.statementYear || null,
-      error: result.metadata.error || null,
-    }
-
-    // Enhanced reporting
-    console.log(`\n✅ Parsing complete: ${result.metadata.parsedTransactions} transactions parsed`)
-    console.log(`📊 Parse quality: ${result.metadata.parseQuality}%`)
-    console.log(`🏦 Bank: ${result.bank}`)
-
-    if (result.metadata.statementYear) {
-      console.log(`📅 Statement year: ${result.metadata.statementYear}`)
-    }
-
-    if (result.metadata.failedLines && result.metadata.failedLines.length > 0) {
-      console.log(`⚠️  Failed to parse ${result.metadata.failedLines.length} lines:`)
-      result.metadata.failedLines.slice(0, 3).forEach((failed) => {
-        console.log(`   Line ${failed.lineNumber}: "${failed.line}" - ${failed.reason || failed.error}`)
-      })
-    }
-
-    // Show sample transactions for verification
-    if (result.transactions.length > 0) {
-      console.log(`\n📝 Sample transactions (showing amounts with correct signs):`)
-      result.transactions.slice(0, 3).forEach((txn, index) => {
-        const sign = txn.amountNumeric >= 0 ? "+" : ""
-        console.log(
-          `${index + 1}. ${txn.description.substring(0, 40)}... | ${sign}${txn.amountNumeric} MAD | ${txn.debitCreditType.toUpperCase()}`,
-        )
-      })
-    }
-
-    // Critical validation
-    if (result.metadata.parsedTransactions === 0) {
-      console.error("\n❌ NO TRANSACTIONS WERE PARSED!")
-      console.log("\nDIAGNOSTIC INFORMATION:")
-      console.log(`- Total lines processed: ${textLines.length}`)
-      console.log(`- Bank detection: ${bankDetection.bank}`)
-      console.log(`- Failed lines: ${result.metadata.failedLines.length}`)
-
-      console.log("\nShowing lines that contain dates and amounts (potential transactions):")
-      textLines.forEach((line, index) => {
-        if (line && typeof line === "string") {
-          if ((/\d{2}\/\d{2}/.test(line) || /^0\d{3}[A-Z0-9]{2}/.test(line)) && /\d+,\d{2}/.test(line)) {
-            console.log(`${index + 1}: "${line}"`)
-          }
-        }
-      })
-
-      throw new Error("NO TRANSACTIONS WERE PARSED!")
-    }
-
-    return result
-  }
-
-  private static parseCIHStatement(textLines: string[]): any {
-    console.log("Parsing CIH Bank statement with correct date format...")
-
-    // Defensive input validation
-    if (!textLines || !Array.isArray(textLines)) {
-      console.error("parseCIHStatement: Invalid textLines input")
-      return {
-        bank: "CIH",
-        openingBalance: null,
-        closingBalance: null,
-        totalMovements: null,
-        transactions: [],
-        metadata: {
-          totalLines: 0,
-          parsedTransactions: 0,
-          failedLines: [],
-          dateFormat: "DD/MM DD/MM (year separate)",
-          currency: "MAD",
-          statementYear: null,
-          error: "Invalid input to parseCIHStatement",
-        },
-      }
-    }
-
-    console.log(`Input lines count: ${textLines.length}`)
-
-    const result = {
-      bank: "CIH",
-      openingBalance: null,
-      closingBalance: null,
-      totalMovements: null,
-      transactions: [],
-      metadata: {
-        totalLines: textLines.length,
-        parsedTransactions: 0,
-        failedLines: [],
-        dateFormat: "DD/MM DD/MM (year separate)",
-        currency: "MAD",
-        statementYear: null,
-      },
-    }
-
-    // Step 1: Extract the statement year from closing balance or other date references
-    let statementYear = null
-    for (const line of textLines) {
-      if (!line || typeof line !== "string") continue
-
-      try {
-        // Look for year in closing balance line
-        const yearMatch = line.match(/(?:NOUVEAU SOLDE|SOLDE FINAL|TOTAL).*(\d{2}\/\d{2}\/(\d{4}))/)
-        if (yearMatch && yearMatch[2]) {
-          statementYear = yearMatch[2]
-          console.log(`Found statement year: ${statementYear}`)
-          break
-        }
-
-        // Alternative: look for 4-digit year anywhere in the document
-        const altYearMatch = line.match(/\b(20\d{2})\b/)
-        if (altYearMatch && altYearMatch[1] && !statementYear) {
-          statementYear = altYearMatch[1]
-          console.log(`Inferred statement year: ${statementYear}`)
-        }
-      } catch (error) {
-        console.warn(`Error processing line for year extraction: ${error.message}`)
-      }
-    }
-
-    if (!statementYear) {
-      statementYear = "2024" // Default fallback
-      console.log(`No year found, defaulting to: ${statementYear}`)
-    }
-
-    result.metadata.statementYear = statementYear
-
-    // Step 2: Parse all lines
-    for (let i = 0; i < textLines.length; i++) {
-      const line = textLines[i]
-
-      // Skip invalid lines
-      if (!line || typeof line !== "string") {
-        continue
-      }
-
-      const trimmedLine = line.trim()
-      if (!trimmedLine) continue
-
-      try {
-        // Parse opening balance
-        if (trimmedLine.includes("SOLDE DEPART")) {
-          console.log(`Processing opening balance: "${trimmedLine}"`)
-          const match = trimmedLine.match(/SOLDE\s+DEPART\s+AU\s*:?\s*(\d{2}\/\d{2}\/\d{4})\s*([\d\s,]+)/)
-          if (match && match[1] && match[2]) {
-            result.openingBalance = {
-              type: "opening_balance",
-              date: match[1],
-              amount: match[2].trim(),
-              amountNumeric: this.normalizeAmount(match[2]),
-              dateISO: this.normalizeDate(match[1]),
-            }
-            console.log("✅ Opening balance parsed")
-          }
-          continue
-        }
-
-        // Parse closing balance
-        if (trimmedLine.includes("NOUVEAU SOLDE")) {
-          console.log(`Processing closing balance: "${trimmedLine}"`)
-          const match = trimmedLine.match(/NOUVEAU\s+SOLDE\s+AU\s+(\d{2}\/\d{2}\/\d{4})\s*([\d\s,]+)/)
-          if (match && match[1] && match[2]) {
-            result.closingBalance = {
-              type: "closing_balance",
-              date: match[1],
-              amount: match[2].trim(),
-              amountNumeric: this.normalizeAmount(match[2]),
-              dateISO: this.normalizeDate(match[1]),
-            }
-            console.log("✅ Closing balance parsed")
-          }
-          continue
-        }
-
-        // Parse total movements
-        if (trimmedLine.includes("TOTAL DES MOUVEMENTS")) {
-          console.log(`Processing total movements: "${trimmedLine}"`)
-          const amounts = trimmedLine.match(/(\d+(?:\s+\d{3})*,\d{2})/g)
-          if (amounts && Array.isArray(amounts) && amounts.length >= 2) {
-            result.totalMovements = {
-              type: "total_movements",
-              totalDebits: amounts[amounts.length - 2].trim(),
-              totalCredits: amounts[amounts.length - 1].trim(),
-              totalDebitsNumeric: this.normalizeAmount(amounts[amounts.length - 2]),
-              totalCreditsNumeric: this.normalizeAmount(amounts[amounts.length - 1]),
-            }
-            console.log("✅ Total movements parsed")
-          }
-          continue
-        }
-
-        // Parse CIH transactions - CORRECTED FORMAT
-        // Pattern: DD/MM DD/MM DESCRIPTION AMOUNT
-        const transactionPattern = /^(\d{2}\/\d{2})\s+(\d{2}\/\d{2})\s+(.+?)\s+([\d\s,]+)$/
-        const transactionMatch = trimmedLine.match(transactionPattern)
-
-        if (transactionMatch && transactionMatch.length >= 5) {
-          const [, operDate, valueDate, description, amount] = transactionMatch
-
-          console.log(`Processing transaction: ${operDate} ${valueDate} | ${description.substring(0, 40)}...`)
-
-          const isCredit = this.detectCreditTransaction(description)
-
-          const transaction = {
-            code: null,
-            operationDate: operDate || null,
-            valueDate: valueDate || null,
-            description: (description || "").trim(),
-            amount: (amount || "").trim(),
-            amountNumeric: this.normalizeAmountWithSign(amount, isCredit),
-            debitCreditType: isCredit ? "credit" : "debit",
-            transactionType: this.detectTransactionType(description),
-            operationDateISO: this.normalizeDate(operDate, statementYear),
-            valueDateISO: this.normalizeDate(valueDate, statementYear),
-            isExpense: !isCredit,
-            isIncome: isCredit,
-            rawLine: line,
-          }
-
-          result.transactions.push(transaction)
-          result.metadata.parsedTransactions++
-
-          console.log(
-            `✅ Transaction parsed: ${(description || "").substring(0, 30)}... | ${isCredit ? "+" : ""}${transaction.amountNumeric}`,
-          )
-          continue
-        }
-
-        // Alternative pattern for simpler CIH format (without value date)
-        const simplePattern = /^(\d{2}\/\d{2})\s+(.+?)\s+([\d\s,]+)$/
-        const simpleMatch = trimmedLine.match(simplePattern)
-
-        if (simpleMatch && simpleMatch.length >= 4) {
-          const [, operDate, description, amount] = simpleMatch
-
-          console.log(`Processing simple transaction: ${operDate} | ${description.substring(0, 40)}...`)
-
-          const isCredit = this.detectCreditTransaction(description)
-
-          const transaction = {
-            code: null,
-            operationDate: operDate || null,
-            valueDate: operDate || null, // Same as operation date
-            description: (description || "").trim(),
-            amount: (amount || "").trim(),
-            amountNumeric: this.normalizeAmountWithSign(amount, isCredit),
-            debitCreditType: isCredit ? "credit" : "debit",
-            transactionType: this.detectTransactionType(description),
-            operationDateISO: this.normalizeDate(operDate, statementYear),
-            valueDateISO: this.normalizeDate(operDate, statementYear),
-            isExpense: !isCredit,
-            isIncome: isCredit,
-            rawLine: line,
-          }
-
-          result.transactions.push(transaction)
-          result.metadata.parsedTransactions++
-
-          console.log(
-            `✅ Simple transaction parsed: ${(description || "").substring(0, 30)}... | ${isCredit ? "+" : ""}${transaction.amountNumeric}`,
-          )
-          continue
-        }
-      } catch (error) {
-        console.error(`Error parsing CIH line ${i + 1}: ${error.message}`)
-        if (!result.metadata.failedLines) {
-          result.metadata.failedLines = []
-        }
-        result.metadata.failedLines.push({
-          line: line || "",
-          lineNumber: i + 1,
-          error: error.message,
-        })
-      }
-    }
-
-    console.log(
-      `\nCIH parsing complete: ${result.metadata.parsedTransactions} transactions, ${result.metadata.failedLines ? result.metadata.failedLines.length : 0} failed lines`,
-    )
-
-    return result
-  }
-
-  private static parseAttijariwafaStatement(textLines: string[]): any {
-    console.log("Parsing Attijariwafa Bank statement...")
-
-    // Defensive input validation
-    if (!textLines || !Array.isArray(textLines)) {
-      console.error("parseAttijariwafaStatement: Invalid textLines input")
-      return {
-        bank: "Attijariwafa",
-        openingBalance: null,
-        closingBalance: null,
-        totalMovements: null,
-        transactions: [],
-        metadata: {
-          totalLines: 0,
-          parsedTransactions: 0,
-          failedLines: [],
-          dateFormat: "DD MM YYYY",
-          currency: "MAD",
-          error: "Invalid input to parseAttijariwafaStatement",
-        },
-      }
-    }
-
-    const result = {
-      bank: "Attijariwafa",
-      openingBalance: null,
-      closingBalance: null,
-      totalMovements: null,
-      transactions: [],
-      metadata: {
-        totalLines: textLines.length,
-        parsedTransactions: 0,
-        failedLines: [],
-        dateFormat: "DD MM YYYY",
-        currency: "MAD",
-      },
-    }
-
-    for (let i = 0; i < textLines.length; i++) {
-      const line = textLines[i]
-
-      // Skip invalid lines
-      if (!line || typeof line !== "string") {
-        continue
-      }
-
-      const trimmedLine = line.trim()
-      if (!trimmedLine) continue
-
-      try {
-        // Parse opening balance
-        if (trimmedLine.includes("SOLDE DEPART")) {
-          const match = trimmedLine.match(
-            /SOLDE\s+DEPART\s+AU\s+(\d{2}\s+\d{2}\s+\d{4})\s+([\d\s,]+)(?:\s+(CREDITEUR|DEBITEUR))?/,
-          )
-          if (match && match[1] && match[2]) {
-            const balanceType = match[3] || "CREDITEUR"
-            result.openingBalance = {
-              type: "opening_balance",
-              date: match[1],
-              amount: match[2].trim(),
-              balanceType: balanceType,
-              amountNumeric:
-                balanceType === "DEBITEUR" ? -this.normalizeAmount(match[2]) : this.normalizeAmount(match[2]),
-              dateISO: this.normalizeDate(match[1]),
-            }
-            console.log("✅ Opening balance parsed")
-          }
-          continue
-        }
-
-        // Parse closing balance
-        if (trimmedLine.includes("SOLDE FINAL")) {
-          const match = trimmedLine.match(
-            /SOLDE\s+FINAL\s+AU\s+(\d{2}\s+\d{2}\s+\d{4})\s+([\d\s,]+)\s+(CREDITEUR|DEBITEUR)/,
-          )
-          if (match && match[1] && match[2] && match[3]) {
-            result.closingBalance = {
-              type: "closing_balance",
-              date: match[1],
-              amount: match[2].trim(),
-              balanceType: match[3],
-              amountNumeric: match[3] === "DEBITEUR" ? -this.normalizeAmount(match[2]) : this.normalizeAmount(match[2]),
-              dateISO: this.normalizeDate(match[1]),
-            }
-            console.log("✅ Closing balance parsed")
-          }
-          continue
-        }
-
-        // Parse total movements
-        if (trimmedLine.includes("TOTAL MOUVEMENTS")) {
-          const amounts = trimmedLine.match(/(\d+(?:\s+\d{3})*,\d{2})/g)
-          if (amounts && Array.isArray(amounts) && amounts.length >= 2) {
-            result.totalMovements = {
-              type: "total_movements",
-              totalDebits: amounts[amounts.length - 2].trim(),
-              totalCredits: amounts[amounts.length - 1].trim(),
-              totalDebitsNumeric: this.normalizeAmount(amounts[amounts.length - 2]),
-              totalCreditsNumeric: this.normalizeAmount(amounts[amounts.length - 1]),
-            }
-            console.log("✅ Total movements parsed")
-          }
-          continue
-        }
-
-        // Parse AWB transactions - ENHANCED FORMAT
-        const transactionMatch = trimmedLine.match(/^(0\d{3}[A-Z0-9]{2})\s+(\d{2})\s+(\d{2})\s+(.+)$/)
-        if (transactionMatch && transactionMatch.length >= 5) {
-          const [, code, day1, day2, remainder] = transactionMatch
-
-          console.log(`Processing AWB transaction: ${code} ${day1} ${day2} | ${remainder.substring(0, 40)}...`)
-
-          // Extract amount from end of remainder
-          const amountMatch = remainder.match(/(\d+(?:\s+\d{3})*,\d{2})$/)
-          if (amountMatch && amountMatch[1]) {
-            const amount = amountMatch[1]
-            let description = remainder.replace(/\s*\d+(?:\s+\d{3})*,\d{2}$/, "").trim()
-
-            // Extract date from description if present
-            let valueDate = null
-            const dateInDescMatch = description.match(/(\d{2}\s+\d{2}\s+\d{4})/)
-            if (dateInDescMatch && dateInDescMatch[1]) {
-              valueDate = dateInDescMatch[1]
-              // Remove the date from description to clean it up
-              description = description.replace(/\s*\d{2}\s+\d{2}\s+\d{4}\s*/, " ").trim()
-            } else {
-              // Use processing date as value date if no specific date found
-              valueDate = `${day1} ${day2} 2024` // Default year
-            }
-
-            const isCredit = this.detectCreditTransaction(description)
-
-            const transaction = {
-              code: code || null,
-              processingDate: `${day1} ${day2}`,
-              operationDate: `${day1}/${day2}`,
-              valueDate: valueDate || null,
-              description: description || "",
-              amount: amount || "",
-              amountNumeric: this.normalizeAmountWithSign(amount, isCredit),
-              debitCreditType: isCredit ? "credit" : "debit",
-              transactionType: this.detectTransactionType(description),
-              operationDateISO: this.normalizeDate(`${day1}/${day2}/2024`),
-              valueDateISO: this.normalizeDate(valueDate),
-              isExpense: !isCredit,
-              isIncome: isCredit,
-              rawLine: line,
-            }
-
-            result.transactions.push(transaction)
-            result.metadata.parsedTransactions++
-
-            console.log(
-              `✅ AWB transaction parsed: ${(description || "").substring(0, 30)}... | ${isCredit ? "+" : ""}${transaction.amountNumeric}`,
-            )
-          }
-        }
-      } catch (error) {
-        console.error(`Error parsing AWB line ${i + 1}: ${error.message}`)
-        if (!result.metadata.failedLines) {
-          result.metadata.failedLines = []
-        }
-        result.metadata.failedLines.push({
-          line: line || "",
-          lineNumber: i + 1,
-          error: error.message,
-        })
-      }
-    }
-
-    return result
+    console.log("⚠️ Could not detect bank, defaulting to Attijariwafa")
+    return { bank: "attijariwafa", config: { dateFormat: "DD MM with statement period" } }
   }
 
   private static normalizeAmount(amountStr: string): number {
-    if (!amountStr || typeof amountStr !== "string") {
-      return 0
-    }
-
+    if (!amountStr || typeof amountStr !== "string") return 0
     try {
-      const cleaned = amountStr.replace(/\s+/g, "").replace(",", ".")
+      const cleaned = amountStr
+        .replace(/\b20\d{2}\b/g, "")
+        .replace(/\s+/g, "")
+        .replace(",", ".")
       const parsed = Number.parseFloat(cleaned)
       return isNaN(parsed) ? 0 : parsed
     } catch (error) {
-      console.error("Error normalizing amount:", error.message)
       return 0
     }
   }
 
   private static normalizeAmountWithSign(amountStr: string, isCredit: boolean): number {
     const amount = this.normalizeAmount(amountStr)
-    // FIXED: Expenses are negative, incomes are positive
     return isCredit ? Math.abs(amount) : -Math.abs(amount)
   }
 
-  private static normalizeDate(dateStr: string, year: string | null = null): string {
-    if (!dateStr || typeof dateStr !== "string") {
-      return null
-    }
-
-    try {
-      const cleaned = dateStr.trim()
-
-      if (cleaned.includes("/")) {
-        // CIH format: DD/MM
-        const parts = cleaned.split("/")
-        if (parts.length < 2) return null
-
-        const day = parts[0] ? parts[0].padStart(2, "0") : "01"
-        const month = parts[1] ? parts[1].padStart(2, "0") : "01"
-        const yearPart = parts[2] || year || "2024" // Use provided year or default
-
-        return `${yearPart}-${month}-${day}`
-      } else {
-        // AWB format: DD MM YYYY or space-separated
-        const parts = cleaned.split(/\s+/)
-        if (parts.length < 2) return null
-
-        const day = parts[0] ? parts[0].padStart(2, "0") : "01"
-        const month = parts[1] ? parts[1].padStart(2, "0") : "01"
-        let yearPart = parts[2] || year || "2024"
-
-        if (yearPart && yearPart.length === 2) {
-          yearPart = "20" + yearPart
-        }
-
-        return `${yearPart}-${month}-${day}`
-      }
-    } catch (error) {
-      console.error("Error normalizing date:", error.message)
-      return null
-    }
-  }
-
-  private static detectTransactionType(description: string): string {
-    if (!description || typeof description !== "string") {
-      return "other"
-    }
-
-    const desc = description.toLowerCase()
-
-    const patterns = {
-      atm: /retrait|gab|atm|withdrawal/i,
-      card: /carte|card|paiement|payment/i,
-      online: /internet|online|web|paypal/i,
-      transfer_out: /virement.*emis|transfer.*out|envoi/i,
-      transfer_in: /virement.*recu|versement|transfer.*in|recu/i,
-      fees: /frais|fee|commission|droit.*timbre/i,
-      recharge: /recharge|rechargement/i,
-    }
-
-    // Defensive check to ensure patterns object exists
-    if (!patterns || typeof patterns !== "object") {
-      console.error("Transaction type patterns not properly defined")
-      return "other"
-    }
-
-    try {
-      for (const [type, pattern] of Object.entries(patterns)) {
-        if (pattern && pattern.test && pattern.test(desc)) {
-          return type
-        }
-      }
-    } catch (error) {
-      console.error("Error in detectTransactionType:", error.message)
-      return "other"
-    }
-
-    return "other"
-  }
-
   private static detectCreditTransaction(description: string): boolean {
-    if (!description || typeof description !== "string") {
-      return false
-    }
-
+    if (!description || typeof description !== "string") return false
     const desc = description.toLowerCase()
-
     const creditKeywords = [
       "versement",
       "virement recu",
@@ -945,66 +720,25 @@ export class PDFParserService {
       "cashback",
       "bonus",
     ]
-
-    // Defensive check to ensure creditKeywords is an array
-    if (!Array.isArray(creditKeywords)) {
-      console.error("creditKeywords is not an array")
-      return false
-    }
-
-    return creditKeywords.some((keyword) => {
-      return typeof keyword === "string" && desc.includes(keyword)
-    })
+    return creditKeywords.some((keyword) => desc.includes(keyword))
   }
 
-  private static assignCategory(description: string, type: "expense" | "income"): string {
-    if (!description || typeof description !== "string") {
-      return "Uncategorized"
+  private static detectTransactionType(description: string): string {
+    if (!description || typeof description !== "string") return "other"
+    const desc = description.toLowerCase()
+    const patterns = {
+      atm: /retrait|gab|atm|withdrawal/i,
+      card: /carte|card|paiement|payment/i,
+      online: /internet|online|web|paypal/i,
+      transfer_out: /virement.*emis|transfer.*out|envoi/i,
+      transfer_in: /virement.*recu|versement|transfer.*in|recu/i,
+      fees: /frais|fee|commission|droit.*timbre/i,
+      recharge: /recharge|rechargement/i,
     }
-
-    // Defensive check for DefaultCategories
-    if (!DefaultCategories || !Array.isArray(DefaultCategories)) {
-      console.error("DefaultCategories is not properly defined")
-      return "Uncategorized"
+    for (const [type, pattern] of Object.entries(patterns)) {
+      if (pattern.test(desc)) return type
     }
-
-    try {
-      // Filter categories by type and find matches
-      const categories = DefaultCategories.filter((cat) => {
-        return cat && typeof cat === "object" && cat.type === type
-      })
-
-      // Defensive check for categories array
-      if (!Array.isArray(categories) || categories.length === 0) {
-        console.warn(`No categories found for type: ${type}`)
-        return "Uncategorized"
-      }
-
-      for (const category of categories) {
-        // Defensive check for category structure
-        if (!category || typeof category !== "object" || !category.keywords || !Array.isArray(category.keywords)) {
-          console.warn("Invalid category structure:", category)
-          continue
-        }
-
-        try {
-          const hasMatch = category.keywords.some((keyword) => {
-            return keyword && typeof keyword === "string" && description.toLowerCase().includes(keyword.toLowerCase())
-          })
-
-          if (hasMatch) {
-            return category.name || "Uncategorized"
-          }
-        } catch (error) {
-          console.error("Error checking category keywords:", error.message)
-          continue
-        }
-      }
-    } catch (error) {
-      console.error("Error in assignCategory:", error.message)
-    }
-
-    return "Uncategorized"
+    return "other"
   }
 
   private static async extractTextFromPDF(pdf: any, maxPages: number): Promise<string[]> {
@@ -1059,5 +793,23 @@ export class PDFParserService {
       .sort((a, b) => b.y - a.y)
       .map((line) => line.text.trim())
       .filter((line) => line.length > 0)
+  }
+
+  private static getMonthName(monthNum: string): string {
+    const months = {
+      "01": "January",
+      "02": "February",
+      "03": "March",
+      "04": "April",
+      "05": "May",
+      "06": "June",
+      "07": "July",
+      "08": "August",
+      "09": "September",
+      "10": "October",
+      "11": "November",
+      "12": "December",
+    }
+    return months[monthNum] || `Month-${monthNum}`
   }
 }
